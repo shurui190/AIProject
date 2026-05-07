@@ -1,24 +1,31 @@
 #!/bin/bash
 # wait-reminder.sh — After timeout, send a Feishu notification reminding the user to respond.
-# Usage: wait-reminder.sh <config_path> "<question text>"
+# Usage: wait-reminder.sh <config_path> "<question text>" [wait|task]
+#   wait = user confirmation scenario (uses wait_reminder_timeout_seconds)
+#   task = long task execution scenario (uses task_reminder_timeout_seconds)
 # The script writes its PID to a file so it can be cancelled if the user responds in time.
 
 if [ $# -lt 2 ]; then
-  echo "Usage: wait-reminder.sh <config_path> \"<question text>\"" >&2
+  echo "Usage: wait-reminder.sh <config_path> \"<question text>\" [wait|task]" >&2
   exit 1
 fi
 
 CONFIG_PATH="$1"
 QUESTION="$2"
+SCENARIO="${3:-wait}"
 PID_FILE="/tmp/lark-notify-reminder.pid"
 
 # Write PID so caller can kill this timer
 echo $$ > "$PID_FILE"
 
-# Read timeout from config, default 180 seconds
+# Read timeout from config based on scenario
 DELAY=180
 if [ -f "$CONFIG_PATH" ]; then
-  TIMEOUT=$(grep -o '"wait_reminder_timeout_seconds"[[:space:]]*:[[:space:]]*[0-9]*' "$CONFIG_PATH" | grep -o '[0-9]*$')
+  if [ "$SCENARIO" = "task" ]; then
+    TIMEOUT=$(grep -o '"task_reminder_timeout_seconds"[[:space:]]*:[[:space:]]*[0-9]*' "$CONFIG_PATH" | grep -o '[0-9]*$')
+  else
+    TIMEOUT=$(grep -o '"wait_reminder_timeout_seconds"[[:space:]]*:[[:space:]]*[0-9]*' "$CONFIG_PATH" | grep -o '[0-9]*$')
+  fi
   if [ -n "$TIMEOUT" ] && [ "$TIMEOUT" -gt 0 ] 2>/dev/null; then
     DELAY=$TIMEOUT
   fi

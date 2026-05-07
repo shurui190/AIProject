@@ -3,5 +3,6 @@
     "chat_id": "oc_xxxxx"
   },
   "prefer": "chat_id",
-  "wait_reminder_timeout_seconds": 180
+  "wait_reminder_timeout_seconds": 60,
+  "task_reminder_timeout_seconds": 300
 }

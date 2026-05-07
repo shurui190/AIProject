@@ -55,12 +55,14 @@ description: >
     "chat_id": "oc_xxxxx"
   },
   "prefer": "chat_id",
-  "wait_reminder_timeout_seconds": 180
+  "wait_reminder_timeout_seconds": 60,
+  "task_reminder_timeout_seconds": 300
 }
 ```
 
 `prefer` 决定优先使用哪种方式发送：`chat_id` 或 `user_id`。
-`wait_reminder_timeout_seconds` 设置等待确认提醒的超时时间，单位秒，默认 180（3 分钟）。
+`wait_reminder_timeout_seconds`：等待用户确认的超时时间（默认 60 秒 / 1 分钟）。
+`task_reminder_timeout_seconds`：复杂任务执行中的提醒超时（默认 300 秒 / 5 分钟）。
 
 > **安全提示**：`.lark-notify.json` 已包含个人 ID，上传 GitHub 前建议将真实 ID 替换为占位符（如 `ou_xxxxx`），或加入 `.gitignore`。
 
@@ -157,11 +159,11 @@ Claude 的工具调用是同步阻塞的——调用 AskUserQuestion 后 Claude 
 **第一步**：先启动后台计时器（在调用 AskUserQuestion 之前）：
 
 ```bash
-bash "{{SKILL_DIR}}/scripts/wait-reminder.sh" "{{SKILL_DIR}}/.lark-notify.json" "待确认的问题内容" &
+bash "{{SKILL_DIR}}/scripts/wait-reminder.sh" "{{SKILL_DIR}}/.lark-notify.json" "待确认的问题内容" wait &
 ```
 
-- 超时时间从配置文件 `.lark-notify.json` 的 `wait_reminder_timeout_seconds` 字段读取（默认 180 秒）
-- 第二个参数是待确认的问题文本
+- 第三个参数 `wait` 表示用户确认场景，使用 `wait_reminder_timeout_seconds`（默认 60 秒）
+- 如果是复杂任务执行中的提醒，传 `task`，使用 `task_reminder_timeout_seconds`（默认 300 秒）
 - `&` 表示后台运行，不会阻塞 Claude
 
 **第二步**：启动计时器后，再调用 AskUserQuestion
@@ -175,10 +177,10 @@ rm -f /tmp/lark-notify-reminder.pid
 
 ### 完整流程
 
-1. Claude 需要用户确认 → **先**启动后台计时器：`bash scripts/wait-reminder.sh <config_path> "问题内容" &`
+1. Claude 需要用户确认 → **先**启动后台计时器：`bash scripts/wait-reminder.sh <config_path> "问题内容" wait &`
 2. **然后**调用 AskUserQuestion
 3. 用户及时回答 → 取消计时器（kill PID）
-4. 用户超时未回答（默认 3 分钟，可在配置文件调整） → 计时器自动发送飞书提醒（包含待确认问题）
+4. 用户超时未回答（默认 1 分钟） → 计时器自动发送飞书提醒（包含待确认问题）
 5. 用户看到飞书消息后回到终端操作
 
 ### 提醒消息格式

@@ -2,5 +2,6 @@
   "notify_target": {
     "chat_id": "oc_xxxxx"
   },
-  "prefer": "chat_id"
+  "prefer": "chat_id",
+  "wait_reminder_timeout_seconds": 180
 }

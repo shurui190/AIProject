@@ -2,8 +2,9 @@
 name: lark-task-notify
 description: >
   飞书任务通知：在执行长时间思考任务时，通过飞书 CLI (lark-cli) 向用户发送"正在思考中"的进度通知，任务完成后发送结构化结果摘要。
+  当需要用户确认且用户可能不在终端时，启动后台计时器，超时后发送飞书提醒。
   当用户提到"飞书通知"、"lark 通知"、"任务完成通知"、"思考通知"、"lark-task-notify"、或者当 Claude 判断当前任务较复杂可能需要较长时间时，应使用此 skill。
-  也适用于用户说"完成后告诉我"、"做完通知我"、"思考中通知我"等场景。
+  也适用于用户说"完成后告诉我"、"做完通知我"、"思考中通知我"、"等待确认通知我"等场景。
 ---
 
 # 飞书任务通知 (lark-task-notify)
@@ -17,6 +18,7 @@ description: >
 - 需要多步调试的问题排查
 - 复杂的数据分析或报告生成
 - 用户明确要求"完成后通知我"
+- Claude 需要用户确认/回答问题，但用户可能不在终端前
 
 ## 前置条件
 
@@ -52,11 +54,13 @@ description: >
     "user_id": "ou_xxxxx",
     "chat_id": "oc_xxxxx"
   },
-  "prefer": "chat_id"
+  "prefer": "chat_id",
+  "wait_reminder_timeout_seconds": 180
 }
 ```
 
 `prefer` 决定优先使用哪种方式发送：`chat_id` 或 `user_id`。
+`wait_reminder_timeout_seconds` 设置等待确认提醒的超时时间，单位秒，默认 180（3 分钟）。
 
 > **安全提示**：`.lark-notify.json` 已包含个人 ID，上传 GitHub 前建议将真实 ID 替换为占位符（如 `ou_xxxxx`），或加入 `.gitignore`。
 
@@ -137,3 +141,48 @@ lark-cli im +messages-send \
 - 如果飞书 CLI 发送失败，不要因此阻塞主任务。记录错误并继续执行主要任务。
 - 不要对简单任务（单文件修改、简单查询等）发送"思考中"通知，避免打扰用户。
 - 同一个任务只发一次"思考中"通知和一次"完成/失败"通知，不要重复发送。
+
+---
+
+## 等待确认提醒
+
+当 Claude 需要用户确认或回答问题（如使用 AskUserQuestion），且用户可能不在终端前时，启动后台计时器。超时后自动发送飞书提醒。
+
+### 使用方式
+
+在调用 AskUserQuestion 或等待用户输入的同时，启动后台计时器脚本：
+
+```bash
+bash "{{SKILL_DIR}}/scripts/wait-reminder.sh" "{{SKILL_DIR}}/.lark-notify.json" "待确认的问题内容" &
+```
+
+- 超时时间从配置文件 `.lark-notify.json` 的 `wait_reminder_timeout_seconds` 字段读取（默认 180 秒）
+- 第二个参数是待确认的问题文本
+
+### 取消计时器
+
+如果用户在超时前已回答，立即取消计时器，避免误发提醒：
+
+```bash
+kill $(cat /tmp/lark-notify-reminder.pid) 2>/dev/null
+rm -f /tmp/lark-notify-reminder.pid
+```
+
+### 完整流程
+
+1. Claude 需要用户确认 → 调用 AskUserQuestion
+2. **同时**启动后台计时器：`bash scripts/wait-reminder.sh <config_path> "问题内容" &`
+3. 用户及时回答 → 取消计时器（kill PID）
+4. 用户超时未回答（默认 3 分钟，可在配置文件调整） → 自动发送飞书提醒（包含待确认问题）
+5. 用户看到飞书消息后回到终端操作
+
+### 提醒消息格式
+
+```
+🔔 Claude 等待确认
+---
+待确认问题：
+{{用户需要回答的问题}}
+---
+请回到 Claude Code 终端进行操作
+```

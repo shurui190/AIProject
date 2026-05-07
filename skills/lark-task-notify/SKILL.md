@@ -148,9 +148,13 @@ lark-cli im +messages-send \
 
 当 Claude 需要用户确认或回答问题（如使用 AskUserQuestion），且用户可能不在终端前时，启动后台计时器。超时后自动发送飞书提醒。
 
+### 重要：计时器必须在 AskUserQuestion 之前启动
+
+Claude 的工具调用是同步阻塞的——调用 AskUserQuestion 后 Claude 无法执行其他操作。因此**必须先启动后台计时器，再调用 AskUserQuestion**。
+
 ### 使用方式
 
-在调用 AskUserQuestion 或等待用户输入的同时，启动后台计时器脚本：
+**第一步**：先启动后台计时器（在调用 AskUserQuestion 之前）：
 
 ```bash
 bash "{{SKILL_DIR}}/scripts/wait-reminder.sh" "{{SKILL_DIR}}/.lark-notify.json" "待确认的问题内容" &
@@ -158,10 +162,11 @@ bash "{{SKILL_DIR}}/scripts/wait-reminder.sh" "{{SKILL_DIR}}/.lark-notify.json" 
 
 - 超时时间从配置文件 `.lark-notify.json` 的 `wait_reminder_timeout_seconds` 字段读取（默认 180 秒）
 - 第二个参数是待确认的问题文本
+- `&` 表示后台运行，不会阻塞 Claude
 
-### 取消计时器
+**第二步**：启动计时器后，再调用 AskUserQuestion
 
-如果用户在超时前已回答，立即取消计时器，避免误发提醒：
+**第三步**：用户回答后，立即取消计时器：
 
 ```bash
 kill $(cat /tmp/lark-notify-reminder.pid) 2>/dev/null
@@ -170,10 +175,10 @@ rm -f /tmp/lark-notify-reminder.pid
 
 ### 完整流程
 
-1. Claude 需要用户确认 → 调用 AskUserQuestion
-2. **同时**启动后台计时器：`bash scripts/wait-reminder.sh <config_path> "问题内容" &`
+1. Claude 需要用户确认 → **先**启动后台计时器：`bash scripts/wait-reminder.sh <config_path> "问题内容" &`
+2. **然后**调用 AskUserQuestion
 3. 用户及时回答 → 取消计时器（kill PID）
-4. 用户超时未回答（默认 3 分钟，可在配置文件调整） → 自动发送飞书提醒（包含待确认问题）
+4. 用户超时未回答（默认 3 分钟，可在配置文件调整） → 计时器自动发送飞书提醒（包含待确认问题）
 5. 用户看到飞书消息后回到终端操作
 
 ### 提醒消息格式

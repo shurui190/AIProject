@@ -1,0 +1,6 @@
+{
+  "notify_target": {
+    "chat_id": "oc_xxxxx"
+  },
+  "prefer": "chat_id"
+}

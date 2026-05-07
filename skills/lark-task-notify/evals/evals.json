@@ -1,0 +1,23 @@
+{
+  "skill_name": "lark-task-notify",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我分析一下当前项目的代码结构，找出所有可能的性能瓶颈，并给出优化建议。这是一个比较大的项目，请仔细分析。",
+      "expected_output": "Claude 应在开始分析前发送飞书'思考中'通知，分析完成后发送结构化结果摘要通知",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "重构整个项目的错误处理逻辑，统一使用自定义错误类型替换所有裸 throw 和 console.log。",
+      "expected_output": "Claude 应在开始重构前发送飞书'思考中'通知，完成后发送包含修改文件路径的结果通知",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "帮我写一个 hello world 程序",
+      "expected_output": "简单任务，不应触发飞书通知",
+      "files": []
+    }
+  ]
+}

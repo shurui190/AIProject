@@ -1,0 +1,3 @@
+﻿interface:
+  display_name: "AI Session Log"
+  short_description: "Record and query AI conversation history locally"

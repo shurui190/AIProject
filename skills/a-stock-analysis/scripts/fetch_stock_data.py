@@ -1,12 +1,55 @@
 #!/usr/bin/env python3
 """
-A股个股深度数据获取脚本 (v3.0)
-新增: 多数据源fallback（东方财富→腾讯→新浪）、盘后可用、各API独立失败不崩溃
-K线: 日线 (新浪 scale=240)
+股票深度数据获取脚本 (v4.0) — 支持 A股 + 美股
+新增 v4.0: 市场自动识别（数字代码=A股，字母开头=美股）
+  - A股: 行情 东财→腾讯→新浪；K线 新浪；资金流/龙虎榜/F10/新闻 东财/新浪
+  - 美股: 行情 东财(105/106/107)→腾讯(usXXX)→新浪(gb_XXX)；K线 东财 push2his
+  - 美股缺失维度(财务明细/龙虎榜/股东人数/主营业务/新闻)输出缺省提示，不崩溃
 用法: python fetch_stock_data.py <code> [--json]
+  A股示例: python fetch_stock_data.py 600111
+  美股示例: python fetch_stock_data.py MU
 """
 
-import urllib.request, json, re, sys, time
+import urllib.request, urllib.error, json, re, sys, time, ssl
+
+# 控制台输出兼容：Windows GBK 终端下 emoji/制表符会报 UnicodeEncodeError，统一走 UTF-8
+for _stream in (getattr(sys, 'stdout', None), getattr(sys, 'stderr', None)):
+    try:
+        if _stream is not None:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+# SSL兼容层：部分Windows/msys2环境证书链不完整，验证失败时自动降级为不校验
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX_NO_VERIFY = ssl.create_default_context()
+_SSL_CTX_NO_VERIFY.check_hostname = False
+_SSL_CTX_NO_VERIFY.verify_mode = ssl.CERT_NONE
+
+def _urlopen_ssl_fallback(req, timeout):
+    """优先使用系统证书验证；仅当证书校验失败时降级为不校验SSL"""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX)
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, ssl.SSLError):
+            return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX_NO_VERIFY)
+        raise
+    except ssl.SSLError:
+        return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX_NO_VERIFY)
+
+_EM_HOSTS_QUOTE = ['push2.eastmoney.com', 'push2delay.eastmoney.com']
+_EM_HOSTS_HIS = ['push2his.eastmoney.com', 'push2delay.eastmoney.com']
+
+def _get_em(path, hosts, referer='https://quote.eastmoney.com/', timeout=10, retries=1):
+    """东财多主机容错：主站失败时自动切换备用主机（如 push2delay）"""
+    last = None
+    for h in hosts:
+        try:
+            return _get(f'https://{h}{path}', referer=referer, timeout=timeout, retries=retries)
+        except Exception as e:
+            last = e
+            continue
+    raise last
 
 # ═══════════════════════════════════════════════════════════
 # 工具函数
@@ -23,7 +66,7 @@ def _get(url, timeout=10, referer='https://quote.eastmoney.com/', decode=None, r
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=headers)
-            resp = urllib.request.urlopen(req, timeout=timeout)
+            resp = _urlopen_ssl_fallback(req, timeout)
             raw = resp.read()
             if decode == 'gb2312': return raw.decode('gb2312', errors='ignore')
             return raw.decode('utf-8', errors='ignore')
@@ -35,6 +78,28 @@ def _get(url, timeout=10, referer='https://quote.eastmoney.com/', decode=None, r
 def _secid(code):
     return f"{'1' if code.startswith(('6','5')) else '0'}.{code}"
 
+def _is_us_code(code):
+    """判断是否为美股代码（字母开头，如 MU / SPCX / BRK.B）"""
+    return bool(re.fullmatch(r'[A-Za-z][A-Za-z0-9.\-]{0,9}', code))
+
+_US_SECID_CACHE = {}
+def _find_us_secid(code):
+    """查找美股在东财的 secid（105=纳斯达克, 106=纽交所, 107=美交所）"""
+    if code in _US_SECID_CACHE:
+        return _US_SECID_CACHE[code]
+    found = None
+    for m in ('105', '106', '107'):
+        path = f'/api/qt/stock/get?secid={m}.{code}&fields=f57,f58'
+        try:
+            d = json.loads(_get_em(path, _EM_HOSTS_QUOTE)).get('data')
+            if d and d.get('f58'):
+                found = f'{m}.{code}'
+                break
+        except Exception:
+            continue
+    _US_SECID_CACHE[code] = found
+    return found
+
 # ═══════════════════════════════════════════════════════════
 # 1. 实时行情（多数据源fallback）
 #    优先级: 东方财富 → 腾讯 → 新浪
@@ -43,9 +108,9 @@ def _secid(code):
 def fetch_quote_eastmoney(code):
     """东方财富行情API（开盘时段最优，盘后关闭）"""
     fields = 'f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f116,f117,f162,f167,f169,f170,f168'
-    url = f'https://push2.eastmoney.com/api/qt/stock/get?secid={_secid(code)}&fields={fields}'
+    path = f'/api/qt/stock/get?secid={_secid(code)}&fields={fields}'
     try:
-        d = json.loads(_get(url, referer='https://quote.eastmoney.com/')).get('data')
+        d = json.loads(_get_em(path, _EM_HOSTS_QUOTE)).get('data')
         if not d: return None
         return {
             'name': d.get('f58',''), 'code': d.get('f57',code),
@@ -167,6 +232,159 @@ def fetch_quote_with_fallback(code):
     return None, ['所有行情API均不可用']
 
 # ═══════════════════════════════════════════════════════════
+# 1b. 美股行情 (v4.0) — 东方财富 → 腾讯(usXXX) → 新浪(gb_XXX)
+#     东财/腾讯/新浪对美股的字段布局与A股不同，分开实现；三者字段互补自动合并
+# ═══════════════════════════════════════════════════════════
+def fetch_quote_eastmoney_us(code):
+    """东方财富美股行情（secid: 105=NASDAQ, 106=NYSE, 107=AMEX）"""
+    secid = _find_us_secid(code)
+    if not secid: return None
+    fields = 'f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f116,f117,f162,f167,f169,f170,f168'
+    path = f'/api/qt/stock/get?secid={secid}&fields={fields}'
+    try:
+        d = json.loads(_get_em(path, _EM_HOSTS_QUOTE)).get('data')
+        if not d or not d.get('f58'): return None
+        high = round(d.get('f44',0)/1000, 3)
+        low = round(d.get('f45',0)/1000, 3)
+        prev = round(d.get('f60',0)/1000, 3)
+        # 美股字段与A股不同: f169=涨跌额×1000, f170=涨跌幅×100, 价格×1000
+        chg = round(d.get('f169',0)/1000, 2)
+        chg_pct = round(d.get('f170',0)/100, 2)
+        return {
+            'name': d.get('f58',''), 'code': d.get('f57', code), 'secid_us': secid,
+            'price':      round(d.get('f43',0)/1000, 3),
+            'high':       high,
+            'low':        low,
+            'open':       round(d.get('f46',0)/1000, 3),
+            'prev_close': prev,
+            'volume':     d.get('f47',0),
+            'amount':     d.get('f48',0),
+            'amplitude':  round((high-low)/prev*100, 2) if high and low and prev else None,
+            'change_pct': chg_pct,
+            'change':     chg,
+            'turnover':   round(d.get('f168',0)/100,2) if d.get('f168') else None,
+            'market_cap': round(d.get('f116',0)/1e8,1),   # 亿美元
+            'pe_ttm':     None,
+            'pe_dynamic': round(d.get('f167',0)/100,2) if d.get('f167') and d['f167']>0 else None,
+            'currency': 'USD',
+            'is_us': True,
+            'source': '东方财富(美股)',
+        }
+    except Exception:
+        return None
+
+def fetch_quote_tencent_us(code):
+    """腾讯美股行情（格式 usXXX，如 usMU / usSPCX）"""
+    url = f'https://qt.gtimg.cn/q=us{code}'
+    try:
+        raw = _get(url, referer='https://gu.qq.com/', decode='gb2312')
+        m = re.search(r'v_us\w+="([^"]+)"', raw)
+        if not m: return None
+        parts = m.group(1).split('~')
+        if len(parts) < 40 or not parts[3]: return None
+        price = float(parts[3]); prev = float(parts[4]) if parts[4] else 0
+        high = float(parts[33]) if len(parts) > 33 and parts[33] else 0
+        low = float(parts[34]) if len(parts) > 34 and parts[34] else 0
+        pe = float(parts[39]) if len(parts) > 39 and parts[39] and parts[39] not in ('0','--') else None
+        market_cap = None
+        if len(parts) > 45 and parts[45]: market_cap = float(parts[45])
+        elif len(parts) > 44 and parts[44]: market_cap = float(parts[44])
+        return {
+            'name': parts[1], 'code': parts[2],
+            'price': price,
+            'prev_close': prev,
+            'open': float(parts[5]) if parts[5] else 0,
+            'volume': int(parts[6]) if parts[6] else 0,
+            'amount': float(parts[37]) if len(parts) > 37 and parts[37] else 0,
+            'high': high,
+            'low': low,
+            'change': float(parts[31]) if len(parts) > 31 and parts[31] else 0,
+            'change_pct': float(parts[32]) if len(parts) > 32 and parts[32] else 0,
+            'turnover': float(parts[38]) if len(parts) > 38 and parts[38] and parts[38] != '0' else None,
+            'amplitude': round((high-low)/prev*100, 2) if high and low and prev else None,
+            'pe_ttm': pe if pe and pe > 0 else None,
+            'pe_dynamic': None,
+            'market_cap': market_cap,   # 亿美元（best-effort，可能为流通市值）
+            'currency': parts[35] if len(parts) > 35 and parts[35] else 'USD',
+            'is_us': True,
+            'source': '腾讯行情(美股)',
+        }
+    except Exception:
+        return None
+
+def fetch_quote_sina_us(code):
+    """新浪美股行情（格式 gb_XXX，字段布局与A股不同）"""
+    sym = f'gb_{code.lower()}'
+    url = f'https://hq.sinajs.cn/list={sym}'
+    try:
+        raw = _get(url, referer='https://finance.sina.com.cn/', decode='gb2312')
+        m = re.search(rf'var hq_str_{re.escape(sym)}="([^"]+)"', raw)
+        if not m: return None
+        parts = m.group(1).split(',')
+        if len(parts) < 12 or not parts[1]: return None
+        price = float(parts[1])
+        prev = float(parts[26]) if len(parts) > 26 and parts[26] else 0
+        high = float(parts[6]) if len(parts) > 6 and parts[6] else 0
+        low = float(parts[7]) if len(parts) > 7 and parts[7] else 0
+        pe = float(parts[14]) if len(parts) > 14 and parts[14] not in ('--','') else None
+        return {
+            'name': parts[0], 'code': code,
+            'price': price,
+            'prev_close': prev,
+            'open': float(parts[5]) if len(parts) > 5 and parts[5] else 0,
+            'high': high,
+            'low': low,
+            'volume': int(float(parts[10])) if len(parts) > 10 and parts[10] else 0,
+            'amount': float(parts[30]) if len(parts) > 30 and parts[30] else 0,
+            'change': float(parts[4]) if len(parts) > 4 and parts[4] else 0,
+            'change_pct': float(parts[2]) if parts[2] else 0,
+            'amplitude': round((high-low)/prev*100, 2) if high and low and prev else None,
+            'turnover': None,
+            'pe_ttm': pe if pe and pe > 0 else None,
+            'pe_dynamic': None,
+            'market_cap': round(float(parts[12])/1e8, 1) if len(parts) > 12 and parts[12] else None,  # 亿美元
+            'high_52w': float(parts[8]) if len(parts) > 8 and parts[8] else None,
+            'low_52w': float(parts[9]) if len(parts) > 9 and parts[9] else None,
+            'currency': 'USD',
+            'is_us': True,
+            'source': '新浪行情(美股)',
+        }
+    except Exception:
+        return None
+
+def _enrich_us_quote(quote):
+    """用新浪行情补全 52周高低 / PE / 市值（三源字段互补）"""
+    try:
+        sq = fetch_quote_sina_us(quote['code'])
+        if sq:
+            for k in ('high_52w', 'low_52w'):
+                if sq.get(k) is not None and not quote.get(k):
+                    quote[k] = sq[k]
+            if not quote.get('pe_ttm') and sq.get('pe_ttm'):
+                quote['pe_ttm'] = sq['pe_ttm']
+            if not quote.get('market_cap') and sq.get('market_cap'):
+                quote['market_cap'] = sq['market_cap']
+    except Exception:
+        pass
+    return quote
+
+def fetch_quote_with_fallback_us(code):
+    """美股行情3层fallback：东方财富 → 腾讯 → 新浪"""
+    warnings = []
+    quote = fetch_quote_eastmoney_us(code)
+    if quote:
+        return _enrich_us_quote(quote), warnings
+    quote = fetch_quote_tencent_us(code)
+    if quote:
+        warnings.append('东方财富美股行情不可用，已fallback到腾讯行情')
+        return _enrich_us_quote(quote), warnings
+    quote = fetch_quote_sina_us(code)
+    if quote:
+        warnings.append('东方财富/腾讯美股行情不可用，已fallback到新浪行情（数据有限）')
+        return quote, warnings
+    return None, ['所有行情API均不可用']
+
+# ═══════════════════════════════════════════════════════════
 # 2. 财务数据 (新浪财经)
 # ═══════════════════════════════════════════════════════════
 def _parse_sina_financials(html):
@@ -228,14 +446,84 @@ def fetch_kline_daily(code, count=200):
     except Exception:
         return None
 
+def _parse_usd(v):
+    """解析 '$1,011.75' 或 '33,430,510' 这类美股API字符串"""
+    try:
+        return float(str(v).replace('$','').replace(',',''))
+    except Exception:
+        return 0
+
+def fetch_kline_daily_us_em(code, count=200):
+    """美股日线K线（东方财富 push2his，secid 105/106/107；接口偶发限流）"""
+    secid = _find_us_secid(code)
+    if not secid: return None
+    path = f'/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=1&beg=0&end=20500101&lmt={count}'
+    try:
+        d = json.loads(_get_em(path, _EM_HOSTS_HIS)).get('data')
+        if not d or not d.get('klines'): return None
+        klines = []
+        for line in d['klines']:
+            p = line.split(',')
+            klines.append({
+                'date': p[0],
+                'open': float(p[1]), 'close': float(p[2]),
+                'high': float(p[3]), 'low': float(p[4]),
+                'volume': float(p[5]),
+            })
+        return klines
+    except Exception:
+        return None
+
+def fetch_kline_daily_us_nasdaq(code, count=260):
+    """美股日线K线备用源（纳斯达克官网历史接口，返回最近约一年收盘数据）"""
+    url = f'https://api.nasdaq.com/api/quote/{code}/historical?assetclass=stocks&fromdate=2020-01-01&todate=2050-01-01&limit={count}'
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+            'Referer': 'https://www.nasdaq.com/',
+            'Accept': 'application/json, text/plain, */*',
+        })
+        raw = urllib.request.urlopen(req, timeout=15, context=_SSL_CTX_NO_VERIFY).read().decode('utf-8', errors='ignore')
+        rows = json.loads(raw).get('data', {}).get('tradesTable', {}).get('rows') or []
+        if not rows: return None
+        klines = []
+        for r in reversed(rows):   # 接口按日期倒序，转为升序
+            d = r.get('date', '')
+            try:
+                m, day, y = d.split('/')
+                date = f'{y}-{int(m):02d}-{int(day):02d}'
+            except Exception:
+                continue
+            klines.append({
+                'date': date,
+                'open': _parse_usd(r.get('open')),
+                'close': _parse_usd(r.get('close')),
+                'high': _parse_usd(r.get('high')),
+                'low': _parse_usd(r.get('low')),
+                'volume': _parse_usd(r.get('volume')),
+            })
+        return klines if klines else None
+    except Exception:
+        return None
+
+def fetch_kline_daily_us(code, count=200):
+    """美股日线K线：优先东财(push2his)，失败则用纳斯达克官网历史数据"""
+    k = fetch_kline_daily_us_em(code, count)
+    if k: return k, '东方财富(美股)'
+    k = fetch_kline_daily_us_nasdaq(code)
+    if k: return k, '纳斯达克官网'
+    return None, None
+
 # ═══════════════════════════════════════════════════════════
 # 4. 主力资金流向 (东方财富资金流)
 # ═══════════════════════════════════════════════════════════
-def fetch_money_flow(code, days=5):
+def fetch_money_flow(code, days=5, secid=None):
     """获取逐日主力资金流向。返回最近N天的净流入数据。"""
-    url = f'https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?secid={_secid(code)}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54&lmt={days}'
+    if not secid:
+        secid = _secid(code)
+    path = f'/api/qt/stock/fflow/daykline/get?secid={secid}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54&lmt={days}'
     try:
-        d = json.loads(_get(url, referer='https://quote.eastmoney.com/'))
+        d = json.loads(_get_em(path, _EM_HOSTS_HIS))
         if not d.get('data') or not d['data'].get('klines'):
             return None
         flows = []
@@ -323,6 +611,30 @@ def fetch_market_indices():
     except Exception:
         return {}
 
+def fetch_market_indices_us():
+    """获取美股三大指数实时行情（新浪 gb_ 前缀）"""
+    symbols = {'gb_$dji': '道琼斯', 'gb_ixic': '纳斯达克', 'gb_inx': '标普500'}
+    url = f'https://hq.sinajs.cn/list={",".join(symbols.keys())}'
+    try:
+        raw = _get(url, referer='https://finance.sina.com.cn/', decode='gb2312')
+        result = {}
+        for sym, name in symbols.items():
+            m = re.search(rf'var hq_str_{re.escape(sym)}="([^"]+)"', raw)
+            if m:
+                parts = m.group(1).split(',')
+                if len(parts) > 4 and parts[1]:
+                    price = float(parts[1])
+                    change = float(parts[4]) if parts[4] else 0
+                    result[name] = {
+                        'price': price,
+                        'change': change,
+                        'change_pct': float(parts[2]) if parts[2] else 0,
+                        'prev_close': round(price - change, 2),
+                    }
+        return result
+    except Exception:
+        return {}
+
 # ═══════════════════════════════════════════════════════════
 # 6. 板块行情
 # ═══════════════════════════════════════════════════════════
@@ -341,9 +653,9 @@ def fetch_sector(sector_name):
     """获取板块行情"""
     code = SECTOR_MAP.get(sector_name)
     if not code: return None
-    url = f'https://push2.eastmoney.com/api/qt/stock/get?secid={code}&fields=f43,f57,f58,f169,f170'
+    path = f'/api/qt/stock/get?secid={code}&fields=f43,f57,f58,f169,f170'
     try:
-        d = json.loads(_get(url, referer='https://quote.eastmoney.com/')).get('data')
+        d = json.loads(_get_em(path, _EM_HOSTS_QUOTE)).get('data')
         if not d: return None
         return {
             'name': d.get('f58',''),
@@ -456,6 +768,11 @@ def calc_volume(klines):
 def calc_valuation(quote, fin):
     r = {}
     price = quote.get('price', 0)
+    # v4.0: 行情PE兜底（美股财务不在本脚本管道内，PE来自腾讯/新浪行情）
+    if quote.get('pe_ttm'):
+        r['pe_ttm'] = quote['pe_ttm']
+    if quote.get('pe_dynamic'):
+        r['pe_dynamic'] = quote['pe_dynamic']
     eps_q = fin.get('eps', [])
     bps_q = fin.get('bps', [])
     eps_annual = fin.get('eps_annual')
@@ -625,67 +942,85 @@ def fetch_news(code, count=8):
         return None
 
 # ═══════════════════════════════════════════════════════════
-# 9. 综合编排 (v3.0: 解耦架构 + 舆情/龙虎榜/F10数据)
+# 9. 综合编排 (v4.0: 市场自动识别 + 解耦架构 + 舆情/龙虎榜/F10数据)
 # ═══════════════════════════════════════════════════════════
 def analyze(code, sectors=None):
-    """sectors: 可选，要查询的板块列表，如 ['有色金属','小金属']"""
-    result = {'code': code, 'fetch_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'warnings': []}
+    """sectors: 可选，要查询的板块列表，如 ['有色金属','小金属']（仅A股生效）"""
+    is_us = _is_us_code(code)
+    result = {'code': code, 'market': '美股' if is_us else 'A股',
+              'fetch_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'warnings': []}
 
-    # 行情（3层fallback: 东方财富 → 腾讯 → 新浪）
-    quote, quote_warnings = fetch_quote_with_fallback(code)
+    # 行情（A股: 东财→腾讯→新浪；美股: 东财→腾讯(usXXX)→新浪(gb_XXX)）
+    if is_us:
+        quote, quote_warnings = fetch_quote_with_fallback_us(code)
+    else:
+        quote, quote_warnings = fetch_quote_with_fallback(code)
     result['warnings'].extend(quote_warnings)
     if not quote:
         result['error'] = '所有行情API均不可用'
         return result
     result['quote'] = quote
 
-    # 财务（独立，新浪API盘后可用）
-    try:
-        result['financials'] = fetch_financials(code)
-    except Exception:
-        result['financials'] = {'error': '财务数据获取失败'}
-        result['warnings'].append('财务数据获取失败')
+    # 财务（A股: 新浪财报页；美股: 不在本脚本管道内，输出提示由分析者补充）
+    if is_us:
+        result['financials'] = {'us_stock': True, 'note': '美股财务明细不通过本脚本获取，分析时需结合财报/公开信息补充'}
+    else:
+        try:
+            result['financials'] = fetch_financials(code)
+        except Exception:
+            result['financials'] = {'error': '财务数据获取失败'}
+            result['warnings'].append('财务数据获取失败')
 
-    # K线-日线（独立，新浪API盘后可用）
+    # K线-日线（A股: 新浪；美股: 东财 push2his → 纳斯达克官网备用）
     try:
-        klines = fetch_kline_daily(code)
+        if is_us:
+            klines, kline_src = fetch_kline_daily_us(code)
+            if klines: result['kline_source'] = kline_src
+        else:
+            klines = fetch_kline_daily(code)
         if klines:
             result['kline_count'] = len(klines)
             result['kline_latest'] = klines[-1]
             result['kline_range'] = f'{klines[0]["date"]} ~ {klines[-1]["date"]}'
             result['technical'] = calc_technical(klines)
             result['volume'] = calc_volume(klines)
+            # 美股：用K线重新校准52周高低（新股的新浪字段可能失真）
+            if is_us:
+                last_250 = klines[-250:] if len(klines) >= 250 else klines
+                quote['high_52w'] = round(max(k['high'] for k in last_250), 2)
+                quote['low_52w'] = round(min(k['low'] for k in last_250), 2)
         else:
             result['warnings'].append('K线数据获取失败')
     except Exception:
         result['warnings'].append('K线数据获取失败')
 
-    # 主力资金流向（独立，东方财富API盘后关闭）
+    # 主力资金流向（东财资金流，A股/美股共用接口，secid不同）
     try:
-        flows = fetch_money_flow(code, days=5)
+        mf_secid = _find_us_secid(code) if is_us else None
+        flows = fetch_money_flow(code, days=5, secid=mf_secid)
         if flows:
             result['money_flow'] = analyze_money_flow(flows)
         else:
-            result['warnings'].append('主力资金流向数据不可用（盘后关闭）')
+            result['warnings'].append('主力资金流向数据不可用（东财接口限流或盘后关闭）')
     except Exception:
         result['warnings'].append('主力资金流向数据不可用')
 
-    # 估值（独立计算，依赖行情和财务数据）
+    # 估值（独立计算，依赖行情和财务数据；美股走行情PE兜底）
     try:
         result['valuation'] = calc_valuation(quote, result.get('financials', {}))
     except Exception:
         result['valuation'] = {}
         result['warnings'].append('估值计算失败')
 
-    # 大盘指数（独立，新浪API盘后可用）
+    # 大盘指数（A股: 上证/深证/创业板；美股: 道琼斯/纳斯达克/标普500）
     try:
-        result['market_indices'] = fetch_market_indices()
+        result['market_indices'] = fetch_market_indices_us() if is_us else fetch_market_indices()
     except Exception:
         result['market_indices'] = {}
         result['warnings'].append('大盘指数获取失败')
 
-    # 板块行情（独立，东方财富API盘后关闭）
-    if sectors:
+    # 板块行情（东方财富A股板块，美股不适用）
+    if sectors and not is_us:
         try:
             result['sectors'] = {}
             for s in sectors:
@@ -694,37 +1029,42 @@ def analyze(code, sectors=None):
         except Exception:
             result['warnings'].append('板块行情获取失败')
 
-    # P1: 个股新闻/公告（东方财富公告API，盘后可用）
-    try:
-        news = fetch_news(code, count=8)
-        if news:
-            result['news'] = news
-    except Exception:
-        result['warnings'].append('个股新闻获取失败')
+    if is_us:
+        # 美股不适用维度：龙虎榜/股东人数/主营业务(F10)为A股专属，新闻接口不覆盖美股
+        result['warnings'].append('美股不适用: 龙虎榜/股东人数/主营业务(F10)（A股专属数据）')
+        result['warnings'].append('美股个股新闻需另行检索（本脚本暂不覆盖）')
+    else:
+        # P1: 个股新闻/公告（新浪财经个股新闻页面，盘后可用）
+        try:
+            news = fetch_news(code, count=8)
+            if news:
+                result['news'] = news
+        except Exception:
+            result['warnings'].append('个股新闻获取失败')
 
-    # P1/P2: 龙虎榜（东方财富datacenter，盘后可用）
-    try:
-        dt = fetch_dragon_tiger(code, days=10)
-        if dt:
-            result['dragon_tiger'] = dt
-    except Exception:
-        pass  # 龙虎榜数据不是每个股票都有，静默跳过
+        # P1/P2: 龙虎榜（东方财富datacenter，盘后可用）
+        try:
+            dt = fetch_dragon_tiger(code, days=10)
+            if dt:
+                result['dragon_tiger'] = dt
+        except Exception:
+            pass  # 龙虎榜数据不是每个股票都有，静默跳过
 
-    # P2: F10股东人数（东方财富F10，盘后可用）
-    try:
-        holders = fetch_f10_shareholders(code)
-        if holders:
-            result['f10_shareholders'] = holders
-    except Exception:
-        pass
+        # P2: F10股东人数（东方财富F10，盘后可用）
+        try:
+            holders = fetch_f10_shareholders(code)
+            if holders:
+                result['f10_shareholders'] = holders
+        except Exception:
+            pass
 
-    # P2: F10主营业务（东方财富F10，盘后可用）
-    try:
-        biz = fetch_f10_business(code)
-        if biz:
-            result['f10_business'] = biz
-    except Exception:
-        pass
+        # P2: F10主营业务（东方财富F10，盘后可用）
+        try:
+            biz = fetch_f10_business(code)
+            if biz:
+                result['f10_business'] = biz
+        except Exception:
+            pass
 
     return result
 
@@ -734,8 +1074,9 @@ def analyze(code, sectors=None):
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: python fetch_stock_data.py <code> [--json]")
-        print("  数据维度: 行情(3层fallback) | 财务 | K线(日线) | 主力资金 | 大盘指数 | 板块")
-        print("  v3.0新增: 个股新闻 | 龙虎榜 | 股东人数变化 | 主营业务构成")
+        print("  支持A股(600111/002428)与美股(MU/SPCX/NVDA)，字母开头自动识别为美股")
+        print("  数据维度: 行情(多层fallback) | 财务 | K线(日线) | 主力资金 | 大盘指数 | 板块")
+        print("  v3.0新增(A股): 个股新闻 | 龙虎榜 | 股东人数变化 | 主营业务构成")
         sys.exit(1)
 
     code = sys.argv[1]
@@ -765,7 +1106,7 @@ if __name__ == '__main__':
 
     p(f"\n{'═'*65}")
     p(f"  {q.get('name','')} ({q.get('code','')})  日线分析")
-    p(f"  数据时间: {data['fetch_time']}  K线: {data.get('kline_range','无')}")
+    p(f"  数据时间: {data['fetch_time']}  K线: {data.get('kline_range','无')} ({data.get('kline_source','A股-新浪')})")
     p(f"  行情来源: {q.get('source','未知')}")
     p(f"{'═'*65}")
 
@@ -780,7 +1121,8 @@ if __name__ == '__main__':
     # 大盘环境
     if idx:
         p("\n┌─ 大盘环境 ─────────────────────────────────")
-        for name in ['上证指数','深证成指','创业板指']:
+        index_names = ['道琼斯','纳斯达克','标普500'] if q.get('is_us') else ['上证指数','深证成指','创业板指']
+        for name in index_names:
             if name in idx:
                 i = idx[name]
                 p(f"│ {name}: {i['price']:.0f}  {i['change_pct']:+.2f}%")
@@ -790,25 +1132,34 @@ if __name__ == '__main__':
     p("\n┌─ 行情 ─────────────────────────────────────")
     p(f"│ 价格: {q.get('price')}  涨跌: {q.get('change_pct'):+.2f}%  振幅: {q.get('amplitude')}%")
     p(f"│ 今开: {q.get('open')}  最高: {q.get('high')}  最低: {q.get('low')}  昨收: {q.get('prev_close')}")
-    p(f"│ 总市值: {q.get('market_cap')}亿  PE(TTM): {q.get('pe_ttm')}x")
+    mc = q.get('market_cap')
+    if q.get('is_us'):
+        if mc: p(f"│ 总市值: {mc:,.0f}亿美元 ({mc/10000:.2f}万亿美元)  币种: {q.get('currency','USD')}")
+        if q.get('high_52w'): p(f"│ 52周区间: {q.get('low_52w')} ~ {q.get('high_52w')}")
+        p(f"│ PE(TTM): {q.get('pe_ttm')}x")
+    else:
+        p(f"│ 总市值: {mc}亿  PE(TTM): {q.get('pe_ttm')}x")
     p(f"└──────────────────────────────────────────")
 
     # 财务
     p("\n┌─ 财务数据 ────────────────────────────────")
-    if f.get('total_shares'):   p(f"│ 总股本: {f['total_shares']:.0f}万股")
-    if f.get('eps'):             p(f"│ EPS(季度): {f['eps']}")
-    if f.get('eps_annual'):      p(f"│ EPS(年度): {f['eps_annual']}")
-    if f.get('eps_4q'):          p(f"│ EPS(4Q合计): {f['eps_4q']}")
-    if f.get('bps'):             p(f"│ BPS(季度): {f['bps']}")
-    if f.get('roe'):             p(f"│ ROE(季度): {f['roe']}%")
-    if f.get('profit_annual'):   p(f"│ 年度净利润: {f['profit_annual']}亿")
-    if f.get('periods'):         p(f"│ 报告期: {f['periods']}")
-    if f.get('dividends'):       p(f"│ 分红: {f['dividends']}")
+    if f.get('us_stock'):
+        p(f"│ 美股财务明细不通过本脚本获取（分析时结合财报/公开信息补充）")
+    else:
+        if f.get('total_shares'):   p(f"│ 总股本: {f['total_shares']:.0f}万股")
+        if f.get('eps'):             p(f"│ EPS(季度): {f['eps']}")
+        if f.get('eps_annual'):      p(f"│ EPS(年度): {f['eps_annual']}")
+        if f.get('eps_4q'):          p(f"│ EPS(4Q合计): {f['eps_4q']}")
+        if f.get('bps'):             p(f"│ BPS(季度): {f['bps']}")
+        if f.get('roe'):             p(f"│ ROE(季度): {f['roe']}%")
+        if f.get('profit_annual'):   p(f"│ 年度净利润: {f['profit_annual']}亿")
+        if f.get('periods'):         p(f"│ 报告期: {f['periods']}")
+        if f.get('dividends'):       p(f"│ 分红: {f['dividends']}")
     p(f"└──────────────────────────────────────────")
 
     # 估值
     p("\n┌─ 估值分析 ────────────────────────────────")
-    for k, label in [('pe_ttm','PE(TTM)'),('pe_annual','PE(年度)'),('pb','PB'),('roe_ttm','ROE(TTM)%'),('dividend_yield_pct','股息率%'),('profit_annual_yi','年利润(亿)'),('profit_4q_yi','4Q利润(亿)')]:
+    for k, label in [('pe_ttm','PE(TTM)'),('pe_dynamic','PE(动态)'),('pe_annual','PE(年度)'),('pb','PB'),('roe_ttm','ROE(TTM)%'),('dividend_yield_pct','股息率%'),('profit_annual_yi','年利润(亿)'),('profit_4q_yi','4Q利润(亿)')]:
         if k in v: p(f"│ {label}: {v[k]}")
     p(f"└──────────────────────────────────────────")
 
@@ -853,7 +1204,10 @@ if __name__ == '__main__':
         p(f"└──────────────────────────────────────────")
     else:
         p("\n┌─ 主力资金流向 ────────────────────────────")
-        p(f"│ ⚡ 资金流向数据不可用（盘后API关闭）")
+        if q.get('is_us'):
+            p(f"│ ⚡ 美股资金流向数据暂不可用")
+        else:
+            p(f"│ ⚡ 资金流向数据不可用（盘后API关闭）")
         p(f"└──────────────────────────────────────────")
 
     # P1: 个股新闻
